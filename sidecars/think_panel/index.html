@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>思考翻译</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <header class="header">
+      <div class="header-top">
+        <div class="title-wrap">
+          <h1 class="title">思考翻译</h1>
+          <span id="status-pill" class="status-pill" title="实时监听当前会话思考过程">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span id="status-text">同步中</span>
+          </span>
+        </div>
+        <div class="header-actions">
+          <div class="segmented" role="group" aria-label="全局显示模式">
+            <button type="button" class="seg-btn active" data-mode="translation">译文</button>
+            <button type="button" class="seg-btn" data-mode="bilingual">双语</button>
+            <button type="button" class="seg-btn" data-mode="original">原文</button>
+          </div>
+          <button id="btn-auto" type="button" class="pill-btn active" title="自动翻译新增的思考步骤">
+            <span class="mini-dot" aria-hidden="true"></span>
+            <span>自动翻译</span>
+          </button>
+          <button id="btn-settings" type="button" class="icon-btn" title="翻译引擎与设置" aria-label="设置">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="search-box">
+          <svg class="icon search-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="11" cy="11" r="7"/>
+            <path d="m20 20-3.5-3.5"/>
+          </svg>
+          <input id="search-input" type="search" placeholder="筛选思考内容或工具名…" autocomplete="off">
+        </div>
+        <select id="conv-select" class="conv-select" title="切换查看的会话"></select>
+        <button id="btn-translate-all" type="button" class="ghost-btn is-placeholder" title="翻译所有待处理步骤">全部翻译</button>
+        <button id="btn-collapse-all" type="button" class="ghost-btn" title="全部折叠或展开">折叠</button>
+        <button id="btn-follow" type="button" class="ghost-btn active" title="自动滚动到最新思考">跟随</button>
+      </div>
+    </header>
+
+    <main id="main" class="main">
+      <div id="empty-state" class="empty-state hidden">
+        <div class="empty-title">暂无思考过程</div>
+        <div id="empty-desc" class="empty-desc">当 Agent 开始思考并输出推理链时，这里会自动同步并翻译为简体中文。</div>
+      </div>
+      <div id="feed" class="feed"></div>
+    </main>
+
+    <button id="btn-jump-latest" type="button" class="jump-latest hidden">回到底部最新思考 ↓</button>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="settings-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal">
+      <div class="modal-header">
+        <h2 id="settings-title" class="modal-title">思考翻译设置</h2>
+        <button id="btn-close-settings" type="button" class="icon-btn" aria-label="关闭">
+          <svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="field">
+          <label for="cfg-provider">翻译引擎</label>
+          <select id="cfg-provider">
+            <option value="bing">Bing 翻译（免 API Key · 默认推荐）</option>
+            <option value="google">Google 翻译（免 API Key · 需国际网络）</option>
+            <option value="openai">OpenAI / DeepSeek / Ollama 兼容模型</option>
+          </select>
+        </div>
+
+        <div id="cfg-openai-group" class="openai-group hidden">
+          <div class="preset-row">
+            <span class="preset-label">快速填充：</span>
+            <button type="button" class="chip-btn" data-preset="deepseek">DeepSeek</button>
+            <button type="button" class="chip-btn" data-preset="ollama">Ollama 本地</button>
+            <button type="button" class="chip-btn" data-preset="openai">OpenAI</button>
+          </div>
+          <div class="field">
+            <label for="cfg-base-url">Base URL</label>
+            <input id="cfg-base-url" type="text" placeholder="https://api.deepseek.com/v1">
+          </div>
+          <div class="field">
+            <label for="cfg-model">模型名称</label>
+            <input id="cfg-model" type="text" placeholder="deepseek-chat">
+          </div>
+          <div class="field">
+            <label for="cfg-api-key">API Key <span id="cfg-key-hint" class="hint"></span></label>
+            <input id="cfg-api-key" type="password" placeholder="sk-...（本地 Ollama 可留空）" autocomplete="off">
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="cfg-view-mode">默认展示模式</label>
+          <select id="cfg-view-mode">
+            <option value="translation">仅译文（简体中文）</option>
+            <option value="bilingual">双语对照（按段交替）</option>
+            <option value="original">仅原文</option>
+          </select>
+        </div>
+
+        <label class="checkbox-row">
+          <input id="cfg-skip-zh" type="checkbox">
+          <span>自动跳过本身已是中文的思考段落</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input id="cfg-inline-hook" type="checkbox">
+          <span>在主聊天流工具调用间隙内联插入中文译文</span>
+        </label>
+
+        <div id="cfg-test-result" class="test-result hidden"></div>
+      </div>
+      <div class="modal-footer">
+        <span id="cfg-cache-info" class="cache-info">缓存: 0 条</span>
+        <span class="spacer"></span>
+        <button id="btn-clear-cache" type="button" class="ghost-btn">清空缓存</button>
+        <button id="btn-test-provider" type="button" class="ghost-btn">测试连接</button>
+        <button id="btn-save-settings" type="button" class="primary-btn">保存设置</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

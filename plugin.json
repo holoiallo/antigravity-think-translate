@@ -1,0 +1,12 @@
+{
+  "name": "think-translate",
+  "displayName": "思考翻译 (Think Translate)",
+  "version": "1.0.0",
+  "description": "Replicates DeepSeek Harness thinking translation: translates agent reasoning steps into Simplified Chinese in a live side pane with Original/Bilingual/Translation toggle, caching, and one-click retry.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "打开思考过程翻译面板",
+    "查看当前思考翻译插件状态与引擎配置",
+    "用 /think-translate 打开右侧实时中文思考对照窗"
+  ]
+}

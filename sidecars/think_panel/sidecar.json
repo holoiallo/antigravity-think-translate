@@ -1,0 +1,21 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "思考翻译",
+  "description": "复刻 DeepSeek Harness 思考翻译体验：实时同步当前对话的思考过程并翻译为简体中文，支持原文/译文/双语切换与一键重试。",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": false
+  },
+  "ui_config": {
+    "display_name": "思考翻译",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "思考翻译"
+      }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+# OS & editor files
+.DS_Store
+Thumbs.db
+*.swp
+
+# Logs & temporary files
+*.log
+*.tmp
+
+# Local runtime / secrets / dependencies (if ever generated locally)
+node_modules/
+.env
+.env.*
+settings.json
+translation-cache.json
+hook-state/

@@ -1,0 +1,11 @@
+{
+  "think-translate-inline": {
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "node ./hooks/post_invocation.mjs",
+        "timeout": 8
+      }
+    ]
+  }
+}

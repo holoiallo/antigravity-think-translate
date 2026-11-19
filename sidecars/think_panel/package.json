@@ -1,0 +1,6 @@
+{
+  "name": "think-panel-sidecar",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "DeepSeek Harness style thinking translation sidecar for Antigravity"
+}
