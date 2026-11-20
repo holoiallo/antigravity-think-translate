@@ -18,9 +18,16 @@ const DEFAULT_SETTINGS = {
   provider: 'bing', // 'bing' | 'google' | 'openai'
   targetLang: 'zh-Hans',
   autoTranslate: true,
+  smartFollow: true,
   inlineHook: true,
   defaultViewMode: 'translation', // 'translation' | 'bilingual' | 'original'
   skipChinese: true,
+  translateSideQuestions: true,
+  translateAskQuestions: true,
+  translateSubagents: true,
+  translateSwarmBoard: true,
+  translateSwarmWorkers: true,
+  translateSwarmOverview: true,
   openai: {
     baseUrl: 'https://api.deepseek.com/v1',
     apiKey: '',
@@ -28,7 +35,7 @@ const DEFAULT_SETTINGS = {
   },
 };
 
-const MAX_CACHE_ENTRIES = 600;
+const MAX_CACHE_ENTRIES = 1500;
 const REQUEST_TIMEOUT_MS = 18000;
 const MAX_BING_BATCH_ITEMS = 8;
 const MAX_BING_BATCH_CHARS = 2800;
@@ -107,12 +114,15 @@ function pushProseParagraphs(out, chunk) {
 }
 
 /**
- * Replaces inline code spans and URLs with `[[C0]]` placeholders so machine
- * translation does not corrupt identifiers or paths.
+ * Replaces inline code spans, URLs, Swarm @mentions / @#channels, #seq citations,
+ * bracket tags ([done], [stall], [P0]...), and Windows file paths with `[[C0]]`
+ * placeholders so machine translation does not corrupt identifiers or links.
  */
 function protectInlineTokens(text) {
   const tokens = [];
-  const replaced = text.replace(/(`+[^`]+`+|https?:\/\/[^\s)>\]"']+)/g, (m) => {
+  const tokenRe =
+    /(`+[^`]+`+|https?:\/\/[^\s)>\]"']+|\b[A-Za-z]:\\[^\s`"'<>|*?)+,;:.]+(?:\.[A-Za-z0-9]{1,8})?|\[(?:done|stall|quota|channel)\]|(?:^|(?<=[\s([>:]))@[#A-Za-z0-9_.-]+)/gi;
+  const replaced = text.replace(tokenRe, (m) => {
     const idx = tokens.length;
     tokens.push(m);
     return `[[C${idx}]]`;
@@ -387,9 +397,16 @@ export class ThinkingTranslator {
       provider: this.#settings.provider,
       targetLang: this.#settings.targetLang,
       autoTranslate: Boolean(this.#settings.autoTranslate),
+      smartFollow: this.#settings.smartFollow !== false,
       inlineHook: this.#settings.inlineHook !== false,
       defaultViewMode: this.#settings.defaultViewMode,
       skipChinese: Boolean(this.#settings.skipChinese),
+      translateSideQuestions: this.#settings.translateSideQuestions !== false,
+      translateAskQuestions: this.#settings.translateAskQuestions !== false,
+      translateSubagents: this.#settings.translateSubagents !== false,
+      translateSwarmBoard: this.#settings.translateSwarmBoard !== false,
+      translateSwarmWorkers: this.#settings.translateSwarmWorkers !== false,
+      translateSwarmOverview: this.#settings.translateSwarmOverview !== false,
       openai: {
         baseUrl: this.#settings.openai.baseUrl,
         model: this.#settings.openai.model,
@@ -412,6 +429,9 @@ export class ThinkingTranslator {
     if (typeof patch.autoTranslate === 'boolean') {
       next.autoTranslate = patch.autoTranslate;
     }
+    if (typeof patch.smartFollow === 'boolean') {
+      next.smartFollow = patch.smartFollow;
+    }
     if (typeof patch.inlineHook === 'boolean') {
       next.inlineHook = patch.inlineHook;
     }
@@ -420,6 +440,18 @@ export class ThinkingTranslator {
     }
     if (typeof patch.skipChinese === 'boolean') {
       next.skipChinese = patch.skipChinese;
+    }
+    for (const boolKey of [
+      'translateSideQuestions',
+      'translateAskQuestions',
+      'translateSubagents',
+      'translateSwarmBoard',
+      'translateSwarmWorkers',
+      'translateSwarmOverview',
+    ]) {
+      if (typeof patch[boolKey] === 'boolean') {
+        next[boolKey] = patch[boolKey];
+      }
     }
     if (patch.openai && typeof patch.openai === 'object') {
       if (typeof patch.openai.baseUrl === 'string') {
@@ -524,7 +556,7 @@ export class ThinkingTranslator {
 
     if (!candidates.length) return;
 
-    const MAX_CONCURRENT = 2;
+    const MAX_CONCURRENT = 3;
     const activeCount = this.#inFlight.size;
     const slots = Math.max(0, MAX_CONCURRENT - activeCount);
     for (const step of candidates.slice(0, slots)) {

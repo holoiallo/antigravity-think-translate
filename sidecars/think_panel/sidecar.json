@@ -3,7 +3,7 @@
   "args": ["main.mjs"],
   "restart_policy": "always",
   "display_name": "思考翻译",
-  "description": "复刻 DeepSeek Harness 思考翻译体验：实时同步当前对话的思考过程并翻译为简体中文，支持原文/译文/双语切换与一键重试。",
+  "description": "实时同步并原位翻译主会话思考过程、侧边栏支线提问 (/btw)、ask_question 提问卡片、子智能体及 Swarm 多智能体消息板与 Worker 思考，支持跨通道智能跟随、原文/译文/双语切换与一键重试。",
   "has_web_ui": true,
   "agent_permissions": {
     "allows_user_interactions": false

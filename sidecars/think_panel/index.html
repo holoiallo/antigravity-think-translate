@@ -13,7 +13,7 @@
       <div class="header-top">
         <div class="title-wrap">
           <h1 class="title">思考翻译</h1>
-          <span id="status-pill" class="status-pill" title="实时监听当前会话思考过程">
+          <span id="status-pill" class="status-pill" title="实时监听当前会话、侧边栏提问与 Swarm 多智能体">
             <span class="status-dot" aria-hidden="true"></span>
             <span id="status-text">同步中</span>
           </span>
@@ -24,11 +24,15 @@
             <button type="button" class="seg-btn" data-mode="bilingual">双语</button>
             <button type="button" class="seg-btn" data-mode="original">原文</button>
           </div>
-          <button id="btn-auto" type="button" class="pill-btn active" title="自动翻译新增的思考步骤">
+          <button id="btn-auto" type="button" class="pill-btn active" title="自动翻译新增的思考、侧边栏提问与 Swarm 消息">
             <span class="mini-dot" aria-hidden="true"></span>
             <span>自动翻译</span>
           </button>
-          <button id="btn-settings" type="button" class="icon-btn" title="翻译引擎与设置" aria-label="设置">
+          <button id="btn-smart-follow" type="button" class="pill-btn active" title="智能跟随：哪个通道（主思考 / 侧边栏提问 / Swarm）产生新内容，自动切过去并滚到底部">
+            <span class="mini-dot" aria-hidden="true"></span>
+            <span>⚡ 智能跟随</span>
+          </button>
+          <button id="btn-settings" type="button" class="icon-btn" title="翻译引擎与范围设置" aria-label="设置">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
               <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/>
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/>
@@ -37,37 +41,88 @@
         </div>
       </div>
 
+      <!-- Primary Stream Tabs: Main Thinking / Side Questions & Subagents / Swarm Multi-Agent -->
+      <nav id="stream-tabs" class="stream-tabs" role="tablist" aria-label="翻译通道切换">
+        <button type="button" role="tab" class="stream-tab active" data-tab="main" aria-selected="true">
+          <span class="tab-icon" aria-hidden="true">💭</span>
+          <span class="tab-label">主思考</span>
+          <span id="tab-count-main" class="tab-count">0</span>
+          <span id="tab-unread-main" class="tab-unread hidden" title="有新内容"></span>
+        </button>
+        <button type="button" role="tab" class="stream-tab" data-tab="side" aria-selected="false">
+          <span class="tab-icon" aria-hidden="true">💬</span>
+          <span class="tab-label">侧边栏提问</span>
+          <span id="tab-count-side" class="tab-count">0</span>
+          <span id="tab-unread-side" class="tab-unread hidden" title="有新侧边栏提问或子代理动态"></span>
+        </button>
+        <button type="button" role="tab" class="stream-tab" data-tab="swarm" aria-selected="false">
+          <span class="tab-icon" aria-hidden="true">🐝</span>
+          <span class="tab-label">Swarm 多智能体</span>
+          <span id="tab-count-swarm" class="tab-count">0</span>
+          <span id="tab-unread-swarm" class="tab-unread hidden" title="有新 Swarm 消息或 Worker 思考"></span>
+        </button>
+      </nav>
+
       <div class="toolbar">
         <div class="search-box">
           <svg class="icon search-icon" viewBox="0 0 24 24" aria-hidden="true">
             <circle cx="11" cy="11" r="7"/>
             <path d="m20 20-3.5-3.5"/>
           </svg>
-          <input id="search-input" type="search" placeholder="筛选思考内容或工具名…" autocomplete="off">
+          <input id="search-input" type="search" placeholder="筛选原文、译文、@成员或工具名…" autocomplete="off">
         </div>
-        <select id="conv-select" class="conv-select" title="切换查看的会话"></select>
-        <button id="btn-translate-all" type="button" class="ghost-btn is-placeholder" title="翻译所有待处理步骤">全部翻译</button>
+        <select id="conv-select" class="conv-select" title="切换查看的主会话"></select>
+        <button id="btn-translate-all" type="button" class="ghost-btn is-placeholder" title="翻译当前视图所有待处理条目">全部翻译</button>
         <button id="btn-collapse-all" type="button" class="ghost-btn" title="全部折叠或展开">折叠</button>
-        <button id="btn-follow" type="button" class="ghost-btn active" title="自动滚动到最新思考">跟随</button>
+        <button id="btn-follow" type="button" class="ghost-btn active" title="自动滚动到底部最新内容">贴底</button>
+      </div>
+
+      <!-- Context sub-bar for Side Questions & Subagents tab -->
+      <div id="side-subbar" class="subbar hidden">
+        <div class="subbar-row">
+          <div id="side-source-chips" class="chip-strip" role="group" aria-label="侧边栏提问来源筛选"></div>
+          <div class="layer-toggles" role="group" aria-label="内容类型筛选">
+            <button type="button" class="layer-btn active" data-side-layer="thinking" title="显示支线提问与子代理的思考过程">💭 思考</button>
+            <button type="button" class="layer-btn active" data-side-layer="reply" title="显示支线提问回复正文与子代理汇报">💬 回复/报告</button>
+            <button type="button" class="layer-btn active" data-side-layer="ask" title="显示 ask_question 提问与选项卡片">❓ 提问卡</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Context sub-bar for Swarm Multi-Agent tab -->
+      <div id="swarm-subbar" class="subbar hidden">
+        <div class="subbar-row">
+          <div class="swarm-headline">
+            <span class="swarm-bee-badge" aria-hidden="true">🐝</span>
+            <span id="swarm-bar-title" class="swarm-bar-title">Swarm 多智能体</span>
+            <span id="swarm-bar-stats" class="swarm-bar-stats"></span>
+          </div>
+          <div class="layer-toggles" role="group" aria-label="Swarm 层级开关">
+            <button type="button" class="layer-btn active" data-swarm-layer="overview" title="显示 Swarm 概览、目标与任务计划">📋 概览</button>
+            <button type="button" class="layer-btn active" data-swarm-layer="board" title="显示 Swarm 公共消息板 (board.jsonl) 对话">💬 消息板</button>
+            <button type="button" class="layer-btn active" data-swarm-layer="worker_thinking" title="穿插显示各 Swarm Worker 智能体的后台思考过程">💭 Worker 思考</button>
+          </div>
+        </div>
+        <div id="swarm-member-chips" class="chip-strip" role="group" aria-label="按 Swarm 智能体成员筛选"></div>
       </div>
     </header>
 
     <main id="main" class="main">
       <div id="empty-state" class="empty-state hidden">
-        <div class="empty-title">暂无思考过程</div>
+        <div id="empty-title" class="empty-title">暂无思考过程</div>
         <div id="empty-desc" class="empty-desc">当 Agent 开始思考并输出推理链时，这里会自动同步并翻译为简体中文。</div>
       </div>
       <div id="feed" class="feed"></div>
     </main>
 
-    <button id="btn-jump-latest" type="button" class="jump-latest hidden">回到底部最新思考 ↓</button>
+    <button id="btn-jump-latest" type="button" class="jump-latest hidden">回到底部最新内容 ↓</button>
   </div>
 
   <!-- Settings modal -->
   <div id="settings-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="settings-title">
     <div class="modal">
       <div class="modal-header">
-        <h2 id="settings-title" class="modal-title">思考翻译设置</h2>
+        <h2 id="settings-title" class="modal-title">思考与侧边栏翻译设置</h2>
         <button id="btn-close-settings" type="button" class="icon-btn" aria-label="关闭">
           <svg class="icon" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
         </button>
@@ -107,19 +162,56 @@
           <label for="cfg-view-mode">默认展示模式</label>
           <select id="cfg-view-mode">
             <option value="translation">仅译文（简体中文）</option>
-            <option value="bilingual">双语对照（按段交替）</option>
+            <option value="bilingual">双语对照（按段原位交替）</option>
             <option value="original">仅原文</option>
           </select>
         </div>
 
+        <div class="settings-section-title">自动翻译范围与联动</div>
+
+        <label class="checkbox-row">
+          <input id="cfg-smart-follow" type="checkbox">
+          <span>开启跨通道「⚡ 智能跟随」（新消息产生时自动切换到主思考 / 侧边栏提问 / Swarm 标签页）</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input id="cfg-side-questions" type="checkbox">
+          <span>自动同步并翻译侧边栏「支线提问 (Side Questions / /btw)」的思考与回复正文</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input id="cfg-ask-questions" type="checkbox">
+          <span>自动同步并翻译「ask_question 提问与选项卡片」</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input id="cfg-subagents" type="checkbox">
+          <span>自动同步并翻译普通「子智能体 (Subagents)」任务简报、思考与返回报告</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input id="cfg-swarm-board" type="checkbox">
+          <span>自动同步并翻译「Swarm 多智能体」公共消息板对话 (board.jsonl)</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input id="cfg-swarm-workers" type="checkbox">
+          <span>自动关联合并并翻译「Swarm 各 Worker 智能体」各自的后台思考过程</span>
+        </label>
+
+        <label class="checkbox-row">
+          <input id="cfg-swarm-overview" type="checkbox">
+          <span>自动同步并翻译「Swarm 概览与计划」(plan.json / view.json)</span>
+        </label>
+
         <label class="checkbox-row">
           <input id="cfg-skip-zh" type="checkbox">
-          <span>自动跳过本身已是中文的思考段落</span>
+          <span>自动跳过本身已是中文的段落</span>
         </label>
 
         <label class="checkbox-row">
           <input id="cfg-inline-hook" type="checkbox">
-          <span>在主聊天流工具调用间隙内联插入中文译文</span>
+          <span>在主聊天流工具调用间隙内联插入中文译文 (PostInvocation Hook)</span>
         </label>
 
         <div id="cfg-test-result" class="test-result hidden"></div>

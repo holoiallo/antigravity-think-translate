@@ -1,9 +1,15 @@
 /*
- * Think Translate frontend (modeled after DeepSeek Harness reasoning translation UX).
+ * Think Translate frontend (Multi-Stream In-Place Translation UX).
  *
- * Polls `/api/state` incrementally via ETag, preserves original thinking text,
- * supports global and per-card Translation / Bilingual / Original toggles, and
- * safely renders Markdown + fenced code blocks.
+ * Supports:
+ * 1. Three live translation tabs:
+ *    - 💭 主思考 (Main conversation thinking steps)
+ *    - 💬 侧边栏提问 (Side Questions /btw thinking & replies, ask_question cards, Subagents)
+ *    - 🐝 Swarm 多智能体 (Swarm Overview/Plan, Message Board board.jsonl, Worker Thinking)
+ * 2. ⚡ 智能跟随 (Smart Auto-Follow): automatically switches to whichever stream
+ *    produces new content and pins to the latest card, with unread badges when paused.
+ * 3. Per-card & global 译文 / 双语 / 原文 toggles, clickable #seq Swarm citations,
+ *    @mention highlighting, code protection, and scroll-stable incremental DOM updates.
  */
 (() => {
   const POLL_ACTIVE_MS = 1000;
@@ -16,16 +22,48 @@
     conversationId: window.sidecar?.conversationId || params.get('conversationId') || '',
     etag: '',
     data: null,
+    activeTab: 'main', // 'main' | 'side' | 'swarm'
+    unreadTabs: new Set(),
+    prevStreamHeads: { main: '', side: '', swarm: '' },
+    initialStreamSnapDone: false,
+    smartFollow: true,
     globalMode: 'translation', // 'translation' | 'bilingual' | 'original'
-    perCardMode: new Map(), // stepIndex -> 'translation' | 'bilingual' | 'original'
-    collapsed: new Set(), // stepIndex
+    perCardMode: new Map(), // item.id -> 'translation' | 'bilingual' | 'original'
+    collapsed: new Set(), // item.id
     searchQuery: '',
     followLatest: true,
     allCollapsed: false,
     pendingScrollReset: false,
+    // Side tab filters
+    sideSourceFilter: '', // '' = all, or sourceId
+    sideLayers: new Set(['thinking', 'reply', 'ask']),
+    // Swarm tab filters
+    swarmMemberFilter: '', // '' = all, or agent name
+    swarmLayers: new Set(['overview', 'board', 'worker_thinking']),
     pollTimer: null,
     toastTimer: null,
   };
+
+  const TAB_NAMES = {
+    main: '💭 主思考',
+    side: '💬 侧边栏提问',
+    swarm: '🐝 Swarm 多智能体',
+  };
+
+  // Deterministic agent color palette for Swarm members
+  const AGENT_COLORS = [
+    '#2563eb', '#16a34a', '#9333ea', '#db2777', '#0891b2',
+    '#4f46e5', '#ea580c', '#0d9488', '#7c3aed', '#e11d48',
+  ];
+  function colorForAgent(name) {
+    if (!name) return '#3b82f6';
+    if (name === 'coordinator') return '#d97706';
+    let h = 7;
+    for (let i = 0; i < name.length; i++) {
+      h = (h * 31 + name.charCodeAt(i)) >>> 0;
+    }
+    return AGENT_COLORS[h % AGENT_COLORS.length];
+  }
 
   // ---------- Theme synchronization ----------
   function syncThemeScheme() {
@@ -64,17 +102,17 @@
     return json;
   }
 
-  function showToast(msg) {
+  function showToast(msg, durationMs = 2200) {
     const el = $('toast');
     el.textContent = msg;
     el.classList.remove('hidden');
     clearTimeout(uiState.toastTimer);
-    uiState.toastTimer = setTimeout(() => el.classList.add('hidden'), 2000);
+    uiState.toastTimer = setTimeout(() => el.classList.add('hidden'), durationMs);
   }
 
-  // ---------- Safe Markdown & escaping ----------
+  // ---------- Safe Markdown, @mentions & #seq citations ----------
   function escapeHtml(str) {
-    return String(str)
+    return String(str ?? '')
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
@@ -82,7 +120,24 @@
       .replace(/'/g, '&#39;');
   }
 
-  function renderProseMarkdown(raw) {
+  function decorateInlineTokens(escapedHtml, { enableSeqRefs = false } = {}) {
+    // Highlight @mentions and @#channel (even when adjacent to CJK characters)
+    let out = escapedHtml.replace(
+      /(^|[^A-Za-z0-9_-])(@#?[A-Za-z0-9_.-]+?)(?=$|[^A-Za-z0-9_.-]|\.(?:\s|$))/g,
+      (all, pre, mention) => `${pre}<span class="mention-pill">${mention}</span>`
+    );
+    // Highlight #seq citations in Swarm tab (even when adjacent to CJK characters like "修复了#13中")
+    if (enableSeqRefs) {
+      out = out.replace(
+        /(^|[^A-Za-z0-9_&#/-])#([1-9]\d{0,5})(?![A-Za-z0-9_-])/g,
+        (all, pre, digits) =>
+          `${pre}<button type="button" class="seq-ref-btn" data-action="jump-seq" data-seq="${digits}" title="跳转到 Swarm 消息 #${digits}">#${digits}</button>`
+      );
+    }
+    return out;
+  }
+
+  function renderProseMarkdown(raw, { enableSeqRefs = false } = {}) {
     const codeTokens = [];
     const tokenized = String(raw || '').replace(/`([^`\n]+)`/g, (_, inner) => {
       const idx = codeTokens.length;
@@ -104,6 +159,7 @@
       let s = escapeHtml(line);
       s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
       s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+      s = decorateInlineTokens(s, { enableSeqRefs });
       s = s.replace(/\u0000CODE(\d+)\u0000/g, (_, idx) => codeTokens[Number(idx)] || '');
       return s;
     };
@@ -171,17 +227,17 @@
     return blocks;
   }
 
-  function formatTime(iso) {
-    if (!iso) return '';
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return '';
+  function formatTime(isoOrStr) {
+    if (!isoOrStr) return '';
+    const d = new Date(String(isoOrStr).replace(' ', 'T'));
+    if (Number.isNaN(d.getTime())) return String(isoOrStr).slice(11, 19);
     return d.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
   }
 
-  function statusBadgeInfo(step) {
-    switch (step.translationStatus) {
+  function statusBadgeInfo(item) {
+    switch (item.translationStatus) {
       case 'done': {
-        const providerName = step.provider === 'openai' ? 'LLM' : step.provider === 'google' ? 'Google' : 'Bing';
+        const providerName = item.provider === 'openai' ? 'LLM' : item.provider === 'google' ? 'Google' : 'Bing';
         return { cls: 'done', label: `${providerName} · 已译` };
       }
       case 'translating':
@@ -195,55 +251,64 @@
     }
   }
 
-  function getEffectiveMode(step) {
-    const requested = uiState.perCardMode.get(step.stepIndex) || uiState.globalMode;
-    if (step.translationStatus !== 'done') {
+  function getEffectiveMode(item) {
+    const requested = uiState.perCardMode.get(item.id) || uiState.globalMode;
+    if (item.translationStatus !== 'done') {
       return requested === 'original' ? 'original' : requested;
     }
     return requested;
   }
 
-  function renderStepBodyHtml(step, mode) {
+  function renderItemBodyHtml(item, mode) {
     const parts = [];
+    const enableSeqRefs = item.tab === 'swarm';
 
-    if (step.translationStatus === 'error' && step.error) {
+    if (item.promptPreview) {
       parts.push(
-        `<div class="error-banner">` +
-          `<span>翻译失败（已保留原文）：${escapeHtml(step.error)}</span>` +
-          `<button type="button" class="card-btn retry" data-action="retry" data-step="${step.stepIndex}">重试</button>` +
+        `<div class="prompt-context-bar" title="${escapeHtml(item.promptPreview)}">` +
+          `提问上下文：${escapeHtml(item.promptPreview)}` +
         `</div>`
       );
-    } else if (step.translationStatus === 'translating' && mode !== 'original') {
-      parts.push(`<div class="translating-banner">正在将本步思考过程翻译为简体中文，以下先展示原文…</div>`);
     }
 
-    const segments = Array.isArray(step.segments) && step.segments.length
-      ? step.segments
-      : splitFallbackParagraphs(step.thinking);
+    if (item.translationStatus === 'error' && item.error) {
+      parts.push(
+        `<div class="error-banner">` +
+          `<span>翻译失败（已保留原文）：${escapeHtml(item.error)}</span>` +
+          `<button type="button" class="card-btn retry" data-action="retry">重试</button>` +
+        `</div>`
+      );
+    } else if (item.translationStatus === 'translating' && mode !== 'original') {
+      parts.push(`<div class="translating-banner">正在实时翻译为简体中文，以下先展示原文…</div>`);
+    }
 
-    if (mode === 'original' || step.translationStatus !== 'done') {
+    const segments = Array.isArray(item.segments) && item.segments.length
+      ? item.segments
+      : splitFallbackParagraphs(item.thinking);
+
+    if (mode === 'original' || item.translationStatus !== 'done') {
       for (const seg of segments) {
-        parts.push(seg.type === 'code' ? renderCodeBlock(seg.src) : renderProseMarkdown(seg.src));
+        parts.push(seg.type === 'code' ? renderCodeBlock(seg.src) : renderProseMarkdown(seg.src, { enableSeqRefs }));
       }
       return parts.join('');
     }
 
     if (mode === 'translation') {
       for (const seg of segments) {
-        parts.push(seg.type === 'code' ? renderCodeBlock(seg.src) : renderProseMarkdown(seg.dst || seg.src));
+        parts.push(seg.type === 'code' ? renderCodeBlock(seg.src) : renderProseMarkdown(seg.dst || seg.src, { enableSeqRefs }));
       }
       return parts.join('');
     }
 
-    // Bilingual mode: interleave source paragraph and Chinese translation paragraph.
+    // Bilingual mode: interleave source paragraph and Chinese translation paragraph in-place
     for (const seg of segments) {
       if (seg.type === 'code') {
         parts.push(renderCodeBlock(seg.src));
       } else {
         parts.push(
           `<div class="bilingual-pair">` +
-            `<div class="bilingual-src">${renderProseMarkdown(seg.src)}</div>` +
-            `<div class="bilingual-dst">${renderProseMarkdown(seg.dst || seg.src)}</div>` +
+            `<div class="bilingual-src">${renderProseMarkdown(seg.src, { enableSeqRefs })}</div>` +
+            `<div class="bilingual-dst">${renderProseMarkdown(seg.dst || seg.src, { enableSeqRefs })}</div>` +
           `</div>`
         );
       }
@@ -251,25 +316,173 @@
     return parts.join('');
   }
 
-  function getCopyText(step, mode) {
-    if (mode === 'original' || step.translationStatus !== 'done') {
-      return step.thinking;
+  function getCopyText(item, mode) {
+    if (mode === 'original' || item.translationStatus !== 'done') {
+      return item.thinking;
     }
     if (mode === 'translation') {
-      return step.translatedText || step.thinking;
+      return item.translatedText || item.thinking;
     }
-    const segs = step.segments || [];
+    const segs = item.segments || [];
     return segs
       .map((s) => (s.type === 'code' ? s.src : `${s.src}\n${s.dst}`))
       .join('\n\n');
   }
 
-  // ---------- Render UI ----------
+  // ---------- Active Tab Items & Filtering ----------
+  function getRawItemsForTab(tab) {
+    if (!uiState.data) return [];
+    if (tab === 'side') return uiState.data.sideItems || [];
+    if (tab === 'swarm') return uiState.data.swarm?.items || [];
+    return uiState.data.mainSteps || uiState.data.steps || [];
+  }
+
+  function getFilteredItemsForActiveTab() {
+    const raw = getRawItemsForTab(uiState.activeTab);
+    const q = uiState.searchQuery.trim().toLowerCase();
+
+    return raw.filter((item) => {
+      if (uiState.activeTab === 'side') {
+        if (uiState.sideSourceFilter) {
+          if (uiState.sideSourceFilter === 'cat:ask_question') {
+            if (item.category !== 'ask_question') return false;
+          } else if (item.sourceId !== uiState.sideSourceFilter) {
+            return false;
+          }
+        }
+        const isAsk = item.kind === 'ask_question';
+        const isReply = item.kind === 'side_question_reply' || item.kind === 'subagent_reply' || item.kind === 'subagent_brief' || item.kind === 'side_question_prompt';
+        const isThink = item.kind === 'side_question_thinking' || item.kind === 'subagent_thinking';
+        if (isAsk && !uiState.sideLayers.has('ask')) return false;
+        if (isReply && !uiState.sideLayers.has('reply')) return false;
+        if (isThink && !uiState.sideLayers.has('thinking')) return false;
+      } else if (uiState.activeTab === 'swarm') {
+        if (item.category && !uiState.swarmLayers.has(item.category)) {
+          return false;
+        }
+        if (uiState.swarmMemberFilter && item.kind !== 'swarm_overview') {
+          const matchesAgent = item.agent === uiState.swarmMemberFilter;
+          const matchesMention = Array.isArray(item.mentions) && item.mentions.includes(uiState.swarmMemberFilter);
+          if (!matchesAgent && !matchesMention) return false;
+        }
+      }
+
+      if (q) {
+        const hay = [
+          item.badgeLabel || '',
+          item.sourceTitle || '',
+          item.agent ? `@${item.agent}` : '',
+          item.promptPreview || '',
+          item.thinking || '',
+          item.translatedText || '',
+          ...(item.toolNames || []),
+          ...(item.mentions || []),
+        ]
+          .join('\n')
+          .toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+
+      return true;
+    });
+  }
+
+  // ---------- Render Header, Tabs & Subbars ----------
+  function renderSubbars() {
+    const sideBar = $('side-subbar');
+    const swarmBar = $('swarm-subbar');
+
+    sideBar.classList.toggle('hidden', uiState.activeTab !== 'side');
+    swarmBar.classList.toggle('hidden', uiState.activeTab !== 'swarm');
+
+    if (uiState.activeTab === 'side') {
+      const sources = uiState.data?.sideSources || [];
+      const totalCount = (uiState.data?.sideItems || []).length;
+      if (uiState.sideSourceFilter && !sources.some((s) => s.id === uiState.sideSourceFilter)) {
+        uiState.sideSourceFilter = '';
+      }
+
+      const chips = [
+        `<button type="button" class="filter-chip ${uiState.sideSourceFilter === '' ? 'active' : ''}" data-side-source="">` +
+          `<span class="chip-label">全部来源</span><span class="chip-num">${totalCount}</span>` +
+        `</button>`,
+      ];
+      for (const src of sources) {
+        const active = uiState.sideSourceFilter === src.id;
+        chips.push(
+          `<button type="button" class="filter-chip ${active ? 'active' : ''}" data-side-source="${escapeHtml(src.id)}" title="${escapeHtml(src.title)}">` +
+            `<span class="chip-label">${escapeHtml(src.title)}</span>` +
+            `<span class="chip-num">${src.count}</span>` +
+          `</button>`
+        );
+      }
+      const stripEl = $('side-source-chips');
+      const nextHtml = chips.join('');
+      if (stripEl.innerHTML !== nextHtml) stripEl.innerHTML = nextHtml;
+
+      for (const btn of sideBar.querySelectorAll('[data-side-layer]')) {
+        btn.classList.toggle('active', uiState.sideLayers.has(btn.dataset.sideLayer));
+      }
+    }
+
+    if (uiState.activeTab === 'swarm') {
+      const swarm = uiState.data?.swarm || { exists: false, title: '', members: [], items: [] };
+      $('swarm-bar-title').textContent = swarm.title || 'Swarm 多智能体协作';
+
+      const members = swarm.members || [];
+      if (uiState.swarmMemberFilter && !members.some((m) => m.name === uiState.swarmMemberFilter)) {
+        uiState.swarmMemberFilter = '';
+      }
+
+      const workingCount = members.filter((m) => m.status === 'working').length;
+      const waitingCount = members.filter((m) => m.status === 'waiting').length;
+      const killedCount = members.filter((m) => m.status === 'killed').length;
+      const statsParts = [];
+      if (workingCount) statsParts.push(`${workingCount} 运行中`);
+      if (waitingCount) statsParts.push(`${waitingCount} 等待中`);
+      if (killedCount) statsParts.push(`${killedCount} 已结束`);
+      $('swarm-bar-stats').textContent = statsParts.length ? `· ${statsParts.join(' / ')}` : '';
+
+      const chips = [
+        `<button type="button" class="filter-chip ${uiState.swarmMemberFilter === '' ? 'active' : ''}" data-swarm-member="">` +
+          `<span class="chip-label">全部成员</span><span class="chip-num">${(swarm.items || []).length}</span>` +
+        `</button>`,
+      ];
+
+      for (const m of members) {
+        const active = uiState.swarmMemberFilter === m.name;
+        const count = (m.postsCount || 0) + (m.thinkingCount || 0);
+        const statusText = m.status === 'working' ? '运行中' : m.status === 'killed' ? '已终止' : '等待中';
+        const tip = `@${m.name} (${m.role}${m.model ? ' · ' + m.model : ''}) · ${statusText}\n发言: ${m.postsCount || 0} · 思考步: ${m.thinkingCount || 0}`;
+        chips.push(
+          `<button type="button" class="filter-chip ${active ? 'active' : ''} ${m.killed ? 'killed' : ''}" data-swarm-member="${escapeHtml(m.name)}" title="${escapeHtml(tip)}">` +
+            `<span class="member-dot ${escapeHtml(m.status || 'waiting')}"></span>` +
+            `<span class="chip-label">@${escapeHtml(m.name)}</span>` +
+            `<span class="chip-num">${count}</span>` +
+          `</button>`
+        );
+      }
+
+      const stripEl = $('swarm-member-chips');
+      const nextHtml = chips.join('');
+      if (stripEl.innerHTML !== nextHtml) stripEl.innerHTML = nextHtml;
+
+      for (const btn of swarmBar.querySelectorAll('[data-swarm-layer]')) {
+        btn.classList.toggle('active', uiState.swarmLayers.has(btn.dataset.swarmLayer));
+      }
+    }
+  }
+
   function updateHeaderControls() {
     const settings = uiState.data?.settings;
-    const steps = uiState.data?.steps || [];
-    const translatingCount = steps.filter((s) => s.translationStatus === 'translating').length;
-    const pendingCount = steps.filter((s) => s.translationStatus === 'pending').length;
+    const mainSteps = uiState.data?.mainSteps || uiState.data?.steps || [];
+    const sideItems = uiState.data?.sideItems || [];
+    const swarmItems = uiState.data?.swarm?.items || [];
+    const allItems = [...mainSteps, ...sideItems, ...swarmItems];
+
+    const activeItems = getRawItemsForTab(uiState.activeTab);
+    const translatingCount = allItems.filter((s) => s.translationStatus === 'translating').length;
+    const pendingCount = activeItems.filter((s) => s.translationStatus === 'pending' || s.translationStatus === 'error').length;
 
     const pill = $('status-pill');
     const statusText = $('status-text');
@@ -279,54 +492,102 @@
       statusText.textContent = `翻译中 (${translatingCount})`;
     } else if (!settings?.autoTranslate) {
       pill.classList.add('idle');
-      statusText.textContent = `手动模式 · ${steps.length} 条`;
+      statusText.textContent = `手动模式 · ${activeItems.length} 条`;
     } else {
-      statusText.textContent = `实时同步 · ${steps.length} 条`;
+      statusText.textContent = `实时同步 · ${allItems.length} 条`;
     }
 
-    const autoBtn = $('btn-auto');
-    autoBtn.classList.toggle('active', Boolean(settings?.autoTranslate));
+    $('btn-auto').classList.toggle('active', Boolean(settings?.autoTranslate));
+    $('btn-smart-follow').classList.toggle('active', Boolean(uiState.smartFollow));
 
     for (const btn of document.querySelectorAll('.segmented .seg-btn')) {
       btn.classList.toggle('active', btn.dataset.mode === uiState.globalMode);
     }
 
-    // Reserve the slot instead of removing the button: it pops in exactly when a
-    // translation starts, and adding/removing it re-wraps the toolbar — which
-    // shifts the whole card list down by a header height mid-scroll.
+    // Update stream tabs & unread indicators
+    $('tab-count-main').textContent = String(mainSteps.length);
+    $('tab-count-side').textContent = String(sideItems.length);
+    $('tab-count-swarm').textContent = String(swarmItems.length);
+
+    for (const tabBtn of document.querySelectorAll('.stream-tab')) {
+      const tab = tabBtn.dataset.tab;
+      const isActive = tab === uiState.activeTab;
+      tabBtn.classList.toggle('active', isActive);
+      tabBtn.setAttribute('aria-selected', String(isActive));
+      const unreadEl = $(`tab-unread-${tab}`);
+      if (unreadEl) {
+        unreadEl.classList.toggle('hidden', isActive || !uiState.unreadTabs.has(tab));
+      }
+    }
+
     $('btn-translate-all').classList.toggle('is-placeholder', pendingCount === 0);
     $('btn-follow').classList.toggle('active', uiState.followLatest);
     $('btn-collapse-all').textContent = uiState.allCollapsed ? '展开' : '折叠';
+
+    renderSubbars();
   }
 
   // ---------- Feed rendering (incremental, scroll-stable) ----------
-  //
-  // Cards are reconciled *in place*: existing nodes are kept and patched field
-  // by field instead of being rebuilt.  The previous implementation pushed
-  // every child (including unchanged ones) into a DocumentFragment and only
-  // then read `mainEl.scrollTop`; at that moment #feed was empty, the browser
-  // had already clamped `scrollTop` to 0, and the value was written straight
-  // back after `replaceChildren` — hence "jump to the very first card".
   const cardRefs = new WeakMap();
 
-  function toolTagsInnerHtml(step) {
-    const names = Array.isArray(step.toolNames) ? step.toolNames : [];
+  function buildMetaTagsHtml(item) {
+    const parts = [];
+
+    if (item.sourceTitle && item.kind !== 'swarm_post' && item.kind !== 'swarm_worker_thinking') {
+      parts.push(`<span class="source-pill" title="${escapeHtml(item.sourceTitle)}">${escapeHtml(item.sourceTitle)}</span>`);
+    }
+
+    if (item.kind === 'swarm_post') {
+      if (item.channel && item.channel !== 'main') {
+        parts.push(`<span class="channel-pill">#${escapeHtml(item.channel)}</span>`);
+      }
+      const recipients = [];
+      if (Array.isArray(item.mentions)) {
+        for (const m of item.mentions) {
+          if (m !== item.agent) recipients.push(`@${escapeHtml(m)}`);
+        }
+      }
+      if (Array.isArray(item.channelMentions)) {
+        for (const ch of item.channelMentions) {
+          recipients.push(`@#${escapeHtml(ch)}`);
+        }
+      }
+      if (item.isAll) recipients.push('@all');
+      if (recipients.length) {
+        parts.push(
+          `<span class="recipient-tags">→ ${recipients
+            .slice(0, 4)
+            .map((r) => `<span class="recipient-pill">${r}</span>`)
+            .join('')}${recipients.length > 4 ? `<span class="recipient-pill">+${recipients.length - 4}</span>` : ''}</span>`
+        );
+      }
+    }
+
+    if (item.kind === 'swarm_worker_thinking' && item.agentModel) {
+      parts.push(`<span class="tool-tag">${escapeHtml(item.agentModel)}</span>`);
+    }
+
+    const names = Array.isArray(item.toolNames) ? item.toolNames : [];
     if (names.length) {
       let html = names.slice(0, 3).map((t) => `<span class="tool-tag">${escapeHtml(t)}</span>`).join('');
       if (names.length > 3) html += `<span class="tool-tag">+${names.length - 3}</span>`;
-      return html;
+      parts.push(html);
+    } else if (item.kind === 'main_thinking' && item.hasReply) {
+      parts.push('<span class="tool-tag">回复阶段</span>');
     }
-    return step.hasReply ? '<span class="tool-tag">回复阶段</span>' : '';
+
+    return parts.join('');
   }
 
-  function createCardNode(step) {
+  function createCardNode(item) {
     const card = document.createElement('article');
     card.className = 'card';
-    card.dataset.stepCard = String(step.stepIndex);
+    card.dataset.itemCard = item.id;
     card.innerHTML =
       `<div class="card-head">` +
         `<button type="button" class="card-head-left" data-action="toggle-collapse">` +
           `<svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m6 9 6 6 6-6"/></svg>` +
+          `<span class="avatar-slot"></span>` +
           `<span class="step-badge"></span>` +
           `<span class="time-label"></span>` +
           `<span class="tool-tags"></span>` +
@@ -345,6 +606,7 @@
       `<div class="card-body"></div>`;
 
     cardRefs.set(card, {
+      avatarSlot: card.querySelector('.avatar-slot'),
       badge: card.querySelector('.step-badge'),
       time: card.querySelector('.time-label'),
       tools: card.querySelector('.tool-tags'),
@@ -352,6 +614,7 @@
       modeBtns: [...card.querySelectorAll('[data-action="card-mode"]')],
       retry: card.querySelector('[data-action="retry"]'),
       body: card.querySelector('.card-body'),
+      avatarHtml: null,
       badgeText: '',
       timeText: null,
       toolsHtml: null,
@@ -361,43 +624,59 @@
       bodyKey: '',
     });
 
-    updateCardNode(card, step);
+    updateCardNode(card, item);
     return card;
   }
 
-  function updateCardNode(card, step) {
+  function updateCardNode(card, item) {
     const refs = cardRefs.get(card);
     if (!refs) return;
 
-    const keyStr = String(step.stepIndex);
-    if (card.dataset.stepCard !== keyStr) card.dataset.stepCard = keyStr;
+    if (card.dataset.itemCard !== item.id) card.dataset.itemCard = item.id;
+    if (card.dataset.kind !== (item.kind || '')) card.dataset.kind = item.kind || '';
 
-    const isCollapsed = uiState.collapsed.has(step.stepIndex);
+    if (item.agent) {
+      card.style.setProperty('--agent-hue', colorForAgent(item.agent));
+    } else {
+      card.style.removeProperty('--agent-hue');
+    }
+
+    const isCollapsed = uiState.collapsed.has(item.id);
     if (card.classList.contains('collapsed') !== isCollapsed) {
       card.classList.toggle('collapsed', isCollapsed);
     }
 
-    const badgeText = `Step #${step.stepIndex}`;
+    const avatarHtml =
+      item.kind === 'swarm_post' || item.kind === 'swarm_worker_thinking'
+        ? `<span class="swarm-av" aria-hidden="true">${escapeHtml((item.agent || '?').charAt(0).toUpperCase())}</span>`
+        : '';
+    if (refs.avatarHtml !== avatarHtml) {
+      refs.avatarHtml = avatarHtml;
+      refs.avatarSlot.innerHTML = avatarHtml;
+      refs.avatarSlot.classList.toggle('hidden', !avatarHtml);
+    }
+
+    const badgeText = item.badgeLabel || `Step #${item.stepIndex}`;
     if (refs.badgeText !== badgeText) {
       refs.badgeText = badgeText;
       refs.badge.textContent = badgeText;
     }
 
-    const timeStr = formatTime(step.createdAt);
+    const timeStr = formatTime(item.timeLabel || item.createdAt);
     if (refs.timeText !== timeStr) {
       refs.timeText = timeStr;
       refs.time.textContent = timeStr;
       refs.time.classList.toggle('hidden', !timeStr);
     }
 
-    const toolsHtml = toolTagsInnerHtml(step);
+    const toolsHtml = buildMetaTagsHtml(item);
     if (refs.toolsHtml !== toolsHtml) {
       refs.toolsHtml = toolsHtml;
       refs.tools.innerHTML = toolsHtml;
       refs.tools.classList.toggle('hidden', !toolsHtml);
     }
 
-    const badge = statusBadgeInfo(step);
+    const badge = statusBadgeInfo(item);
     const badgeCls = `tr-badge ${badge.cls}`;
     if (refs.badgeCls !== badgeCls) {
       refs.badgeCls = badgeCls;
@@ -408,64 +687,59 @@
       refs.trBadge.textContent = badge.label;
     }
 
-    const mode = getEffectiveMode(step);
+    const mode = getEffectiveMode(item);
     for (const btn of refs.modeBtns) {
       btn.classList.toggle('active', btn.dataset.mode === mode);
     }
 
     const actionLabel =
-      step.translationStatus === 'error'
+      item.translationStatus === 'error'
         ? '重试'
-        : step.translationStatus === 'pending' || step.translationStatus === 'skipped_zh'
+        : item.translationStatus === 'pending' || item.translationStatus === 'skipped_zh'
           ? '翻译'
           : '重译';
     if (refs.actionLabel !== actionLabel) {
       refs.actionLabel = actionLabel;
       refs.retry.textContent = actionLabel;
     }
-    refs.retry.classList.toggle('retry', step.translationStatus === 'error');
+    refs.retry.classList.toggle('retry', item.translationStatus === 'error');
 
-    // Rebuild the body only when the rendered content really changed: during
-    // streaming that is once per new thought hash, not once per unrelated poll.
-    const segments = Array.isArray(step.segments) ? step.segments : null;
+    const segments = Array.isArray(item.segments) ? item.segments : null;
     const bodyKey = [
       mode,
-      step.translationStatus,
-      step.provider || '',
-      step.thoughtHash || '',
-      step.error || '',
+      item.translationStatus,
+      item.provider || '',
+      item.thoughtHash || '',
+      item.error || '',
+      item.promptPreview || '',
       segments ? segments.length : -1,
     ].join('|');
     if (refs.bodyKey !== bodyKey) {
       refs.bodyKey = bodyKey;
-      refs.body.innerHTML = renderStepBodyHtml(step, mode);
+      refs.body.innerHTML = renderItemBodyHtml(item, mode);
     }
   }
 
-  /**
-   * Keyed reconcile: never empties #feed, so `scrollTop` is never clamped back
-   * to 0 by the browser and node identity (selection, focus, anchor) survives.
-   */
-  function applyFeed(steps) {
+  function applyFeed(items) {
     const feedEl = $('feed');
     const existing = new Map();
     for (const child of feedEl.children) {
-      const key = child.dataset.stepCard;
+      const key = child.dataset.itemCard;
       if (key !== undefined) existing.set(key, child);
     }
 
     const wanted = new Set();
     let cursor = feedEl.firstElementChild;
 
-    for (const step of steps) {
-      const keyStr = String(step.stepIndex);
+    for (const item of items) {
+      const keyStr = item.id;
       wanted.add(keyStr);
 
       let node = existing.get(keyStr);
       if (node) {
-        updateCardNode(node, step);
+        updateCardNode(node, item);
       } else {
-        node = createCardNode(step);
+        node = createCardNode(item);
       }
 
       if (node === cursor) {
@@ -476,31 +750,21 @@
     }
 
     for (const child of [...feedEl.children]) {
-      if (!wanted.has(child.dataset.stepCard)) child.remove();
+      if (!wanted.has(child.dataset.itemCard)) child.remove();
     }
   }
 
   // ---------- Scroll management ----------
-  //
-  // Rules enforced here:
-  //  * Auto-follow only ever chases the bottom, and only while the reader has
-  //    not taken over the wheel / touch gesture.
-  //  * Nothing writes `scrollTop` while a wheel gesture is in flight — writing
-  //    cancels Chromium's smooth wheel animation, which is what made fast
-  //    wheeling feel non-linear and "snap" around.
-  //  * When there is no anchor to hold on to, the position is kept as-is.
-  //    Zeroing it here is what threw the reader back to the first card.
-
-  const BOTTOM_EPS = 8;        // 「回到底部」按钮的隐藏阈值
-  const RESUME_EPS = 2;        // 只有真正贴到底部才恢复自动跟随
-  const WHEEL_ACTIVE_MS = 180; // 滚轮 / 触控手势冷却窗口
-  const MIN_SHIFT_PX = 2;      // 小于该偏移视为抖动，绝不写 scrollTop
+  const BOTTOM_EPS = 8;
+  const RESUME_EPS = 2;
+  const WHEEL_ACTIVE_MS = 180;
+  const MIN_SHIFT_PX = 2;
 
   const scrollState = {
     lastTop: 0,
-    keepTop: 0,        // 非空列表里用户最后停留的位置
-    pendingShift: 0,   // 攒够 MIN_SHIFT_PX 再一次性补偿，避免慢速漂移
-    wheelAt: -1e9,     // 最近一次 wheel / touchmove 手势时间
+    keepTop: 0,
+    pendingShift: 0,
+    wheelAt: -1e9,
     pinRaf: 0,
     pinSettleTimer: 0,
     resumeTimer: 0,
@@ -531,7 +795,6 @@
     $('btn-jump-latest').classList.toggle('hidden', isNearBottom($('main')));
   }
 
-  /** The only place that writes `scrollTop`, so lastTop / keepTop never drift. */
   function setScrollTop(next) {
     const mainEl = $('main');
     const clamped = Math.min(maxScrollTop(mainEl), Math.max(0, next));
@@ -545,7 +808,6 @@
     setScrollTop(maxScrollTop($('main')));
   }
 
-  /** Catches up after a gesture settles instead of interrupting it. */
   function schedulePinSettle() {
     if (scrollState.pinSettleTimer) return;
     scrollState.pinSettleTimer = setTimeout(() => {
@@ -563,10 +825,6 @@
     pinToBottom();
   }
 
-  /**
-   * A gesture that ends right at the bottom should resume following — but only
-   * after the gesture window closes, never in the middle of it.
-   */
   function scheduleResumeCheck() {
     if (scrollState.resumeTimer) return;
     scrollState.resumeTimer = setTimeout(() => {
@@ -582,7 +840,6 @@
     if (scrollState.pinRaf) return;
     scrollState.pinRaf = requestAnimationFrame(() => {
       scrollState.pinRaf = 0;
-      // A wheel gesture may have landed between the render and this frame.
       if (!uiState.followLatest) return;
       if (gestureActive()) {
         schedulePinSettle();
@@ -603,10 +860,6 @@
     updateJumpButton();
   }
 
-  /**
-   * Remembers what the reader is actually looking at: the first visible block
-   * inside the first visible card (falls back to the card itself).
-   */
   function captureScrollAnchor() {
     const mainEl = $('main');
     const mainRect = mainEl.getBoundingClientRect();
@@ -623,7 +876,7 @@
       const cardRect = card.getBoundingClientRect();
       if (cardRect.bottom <= mainRect.top + 1) continue;
 
-      snapshot.cardKey = card.dataset.stepCard;
+      snapshot.cardKey = card.dataset.itemCard;
       snapshot.cardDelta = cardRect.top - mainRect.top;
 
       const refs = cardRefs.get(card);
@@ -644,10 +897,7 @@
       break;
     }
 
-    // Only trust a capture that actually found something (an empty #feed reads
-    // scrollTop === 0 and must not overwrite the remembered position).
     if (snapshot.cardKey !== null) scrollState.keepTop = snapshot.top;
-
     return snapshot;
   }
 
@@ -662,15 +912,13 @@
 
     if (snapshot.cardKey !== null) {
       const mainEl = $('main');
-      const card = [...$('feed').children].find((c) => c.dataset.stepCard === snapshot.cardKey);
+      const card = [...$('feed').children].find((c) => c.dataset.itemCard === snapshot.cardKey);
       if (card) {
         const refs = cardRefs.get(card);
         const mainRect = mainEl.getBoundingClientRect();
         let anchorEl = null;
         let anchorDelta = 0;
 
-        // Block-level anchoring is only trustworthy while the card still renders
-        // the same body; otherwise fall back to the card's own top edge.
         if (snapshot.blockIndex >= 0 && refs && refs.bodyKey === snapshot.bodyKey) {
           const kid = refs.body.children[snapshot.blockIndex];
           if (kid) {
@@ -689,23 +937,15 @@
     }
 
     if (shift === null) {
-      // No usable anchor for *this* render (the list was momentarily empty, the
-      // anchor card got filtered out, a layout read raced …). Hold the reader's
-      // position, clamped to the new range. Never jump to the top from a poll.
       setScrollTop(scrollState.keepTop || snapshot.top || 0);
       return;
     }
 
     if (gestureActive()) {
-      // The reader owns the wheel right now: stay out of the way (a write here
-      // cancels Chromium's smooth wheel animation) and re-anchor on the next
-      // render from wherever the gesture lands.
       scrollState.pendingShift = 0;
       return;
     }
 
-    // Sub-pixel noise is accumulated instead of written: one write per render
-    // is enough, and a skipped 1px must not slowly drift the view.
     scrollState.pendingShift += shift;
     if (Math.abs(scrollState.pendingShift) < MIN_SHIFT_PX) return;
 
@@ -714,42 +954,46 @@
     setScrollTop($('main').scrollTop + delta);
   }
 
+  function updateEmptyState(q) {
+    const emptyTitle = $('empty-title');
+    const emptyDesc = $('empty-desc');
+    if (q) {
+      emptyTitle.textContent = '无匹配结果';
+      emptyDesc.textContent = '没有匹配当前筛选条件或关键词的条目，可尝试清除搜索或切换上方筛选标签。';
+      return;
+    }
+    if (uiState.activeTab === 'side') {
+      emptyTitle.textContent = '暂无侧边栏提问或子智能体动态';
+      emptyDesc.textContent =
+        '当您在侧边栏发起支线提问 (/btw)、Agent 弹出 ask_question 提问卡片或调用子智能体 (Subagents) 时，思考与回复会自动在此原位翻译。';
+      return;
+    }
+    if (uiState.activeTab === 'swarm') {
+      emptyTitle.textContent = '当前会话暂无 Swarm 多智能体对话';
+      emptyDesc.textContent =
+        '当会话启动 Swarm 多智能体协作时，Swarm 概览计划、消息板 (@mention / #seq) 与各 Worker 的后台思考会自动在此同步并翻译为中文。';
+      return;
+    }
+    emptyTitle.textContent = '暂无思考过程';
+    emptyDesc.textContent = uiState.conversationId
+      ? '当 Agent 开始思考并输出推理链时，这里会自动同步并翻译为简体中文。'
+      : '未绑定到具体对话，可在上方下拉框选择最近会话。';
+  }
+
   function renderFeed() {
     const feedEl = $('feed');
     const emptyEl = $('empty-state');
-    const steps = uiState.data?.steps || [];
     const q = uiState.searchQuery.trim().toLowerCase();
-    // Consumed once: only an explicit context change (search / conversation
-    // switch) may move the reader to the top. Polls never do.
     const resetScroll = uiState.pendingScrollReset;
     uiState.pendingScrollReset = false;
 
-    const filtered = q
-      ? steps.filter((s) => {
-          const hay = [
-            `step ${s.stepIndex}`,
-            s.thinking,
-            s.translatedText || '',
-            ...(s.toolNames || []),
-          ]
-            .join('\n')
-            .toLowerCase();
-          return hay.includes(q);
-        })
-      : steps;
-
+    const filtered = getFilteredItemsForActiveTab();
     updateHeaderControls();
 
     if (!filtered.length) {
       if (feedEl.firstElementChild) feedEl.replaceChildren();
       emptyEl.classList.remove('hidden');
-      $('empty-desc').textContent = q
-        ? '没有匹配筛选关键词的思考步骤。'
-        : uiState.conversationId
-          ? '当 Agent 开始思考并输出推理链时，这里会自动同步并翻译为简体中文。'
-          : '未绑定到具体对话，可在上方下拉框选择最近会话。';
-      // An emptied list clamps scrollTop to 0 by itself; keep the remembered
-      // position so the next non-empty render can put the reader back.
+      updateEmptyState(q);
       if (resetScroll) {
         scrollState.keepTop = 0;
         scrollState.lastTop = 0;
@@ -758,16 +1002,12 @@
     }
 
     emptyEl.classList.add('hidden');
-
-    // Snapshot the reader's position *before* touching the DOM.
     const snapshot = uiState.followLatest || resetScroll ? null : captureScrollAnchor();
 
     applyFeed(filtered);
 
     if (uiState.followLatest) {
-      // Pin before paint so new content never flashes the old position ...
       requestPinToBottom();
-      // ... and once more next frame in case wrapping / fonts settled late.
       schedulePinToBottom();
       updateJumpButton();
       return;
@@ -775,6 +1015,87 @@
 
     restoreScrollAnchor(snapshot, { reset: resetScroll });
     updateJumpButton();
+  }
+
+  function switchTab(nextTab, { autoSwitched = false } = {}) {
+    if (!['main', 'side', 'swarm'].includes(nextTab)) return;
+    const changed = uiState.activeTab !== nextTab;
+    uiState.activeTab = nextTab;
+    uiState.unreadTabs.delete(nextTab);
+    if (changed) {
+      uiState.followLatest = true;
+      renderFeed();
+      if (autoSwitched) {
+        showToast(`⚡ 智能跟随：已切至「${TAB_NAMES[nextTab]}」最新动态`);
+      }
+      // Trigger a background poll so the server prioritizes translating the newly active tab
+      void pollState(false);
+    } else {
+      updateHeaderControls();
+    }
+  }
+
+  // ---------- Smart Auto-Follow Detection ----------
+  function handleIncomingStreams(res) {
+    const meta = res.streamMeta || {
+      main: { count: 0, latestTs: 0, headKey: '' },
+      side: { count: 0, latestTs: 0, headKey: '' },
+      swarm: { count: 0, latestTs: 0, headKey: '' },
+    };
+
+    if (!uiState.initialStreamSnapDone) {
+      uiState.initialStreamSnapDone = true;
+      uiState.prevStreamHeads = {
+        main: meta.main?.headKey || '',
+        side: meta.side?.headKey || '',
+        swarm: meta.swarm?.headKey || '',
+      };
+
+      // If opened from a focused child (Side Question / Subagent / Swarm Worker), focus that tab
+      if (res.focusedChild?.kind === 'side_question' || res.focusedChild?.kind === 'subagent') {
+        uiState.activeTab = 'side';
+        const prefix = res.focusedChild.kind === 'side_question' ? 'sq:' : 'sub:';
+        uiState.sideSourceFilter = `${prefix}${res.focusedChild.id}`;
+      } else if (res.focusedChild?.kind === 'swarm_worker') {
+        uiState.activeTab = 'swarm';
+      } else if (meta.main.count === 0) {
+        if (meta.swarm.count > 0 && meta.swarm.latestTs >= meta.side.latestTs) {
+          uiState.activeTab = 'swarm';
+        } else if (meta.side.count > 0) {
+          uiState.activeTab = 'side';
+        }
+      }
+      return;
+    }
+
+    const changedTabs = [];
+    for (const tab of ['main', 'side', 'swarm']) {
+      const nextHead = meta[tab]?.headKey || '';
+      const prevHead = uiState.prevStreamHeads[tab] || '';
+      if (nextHead && nextHead !== prevHead && (meta[tab]?.count || 0) > 0) {
+        changedTabs.push({ tab, latestTs: meta[tab]?.latestTs || Date.now() });
+      }
+      uiState.prevStreamHeads[tab] = nextHead;
+    }
+
+    if (!changedTabs.length) return;
+
+    // Sort changed tabs by newest activity timestamp descending
+    changedTabs.sort((a, b) => b.latestTs - a.latestTs);
+    const newestTab = changedTabs[0].tab;
+
+    for (const c of changedTabs) {
+      if (c.tab !== uiState.activeTab) {
+        uiState.unreadTabs.add(c.tab);
+      }
+    }
+
+    if (uiState.smartFollow && !gestureActive() && newestTab !== uiState.activeTab) {
+      uiState.activeTab = newestTab;
+      uiState.unreadTabs.delete(newestTab);
+      uiState.followLatest = true;
+      showToast(`⚡ 智能跟随：已切至「${TAB_NAMES[newestTab]}」最新动态`);
+    }
   }
 
   // ---------- Polling & Conversations ----------
@@ -787,8 +1108,10 @@
         uiState.conversationId = res.currentConversationId || convs[0].id;
       }
       const options = [];
-      if (uiState.conversationId && !convs.some((c) => c.id === uiState.conversationId)) {
-        options.push(`<option value="${escapeHtml(uiState.conversationId)}">当前会话 (${escapeHtml(uiState.conversationId.slice(0, 8))})</option>`);
+      const activeRootId = uiState.data?.rootConvId || uiState.conversationId;
+      if (activeRootId && !convs.some((c) => c.id === activeRootId)) {
+        const title = uiState.data?.rootTitle || `当前会话 (${activeRootId.slice(0, 8)})`;
+        options.push(`<option value="${escapeHtml(activeRootId)}">${escapeHtml(title)}</option>`);
       }
       for (const c of convs) {
         const prefix = c.id === (window.sidecar?.conversationId || res.currentConversationId) ? '★ ' : '';
@@ -798,7 +1121,11 @@
         options.push('<option value="">无可用会话</option>');
       }
       select.innerHTML = options.join('');
-      select.value = uiState.conversationId || '';
+      if (activeRootId && convs.some((c) => c.id === activeRootId)) {
+        select.value = activeRootId;
+      } else {
+        select.value = uiState.conversationId || '';
+      }
     } catch {
       // Ignore conversation list errors cleanly.
     }
@@ -810,59 +1137,154 @@
     try {
       const qs = new URLSearchParams();
       if (uiState.conversationId) qs.set('conversationId', uiState.conversationId);
+      qs.set('activeTab', uiState.activeTab);
       if (!forceRefresh && uiState.etag) qs.set('etag', uiState.etag);
 
       const res = await apiFetch(`/api/state?${qs.toString()}`, { method: 'GET' });
       if (!res.unchanged) {
         uiState.etag = res.etag || '';
         uiState.data = res;
-        if (!initialSettingsApplied && res.settings?.defaultViewMode) {
-          uiState.globalMode = res.settings.defaultViewMode;
+        if (!initialSettingsApplied && res.settings) {
+          if (res.settings.defaultViewMode) uiState.globalMode = res.settings.defaultViewMode;
+          if (typeof res.settings.smartFollow === 'boolean') uiState.smartFollow = res.settings.smartFollow;
           initialSettingsApplied = true;
+        } else if (res.settings && typeof res.settings.smartFollow === 'boolean') {
+          uiState.smartFollow = res.settings.smartFollow;
         }
+        handleIncomingStreams(res);
         renderFeed();
       }
     } catch {
       // Keep last good state visible during transient restart.
     } finally {
-      const hasTranslating = (uiState.data?.steps || []).some((s) => s.translationStatus === 'translating');
+      const allItems = [
+        ...(uiState.data?.mainSteps || []),
+        ...(uiState.data?.sideItems || []),
+        ...(uiState.data?.swarm?.items || []),
+      ];
+      const hasTranslating = allItems.some((s) => s.translationStatus === 'translating');
       clearTimeout(uiState.pollTimer);
       uiState.pollTimer = setTimeout(() => pollState(false), hasTranslating ? POLL_ACTIVE_MS : POLL_IDLE_MS);
     }
   }
 
+  // ---------- Jump to Swarm #seq ----------
+  function jumpToSwarmSeq(seqNum) {
+    const targetId = `swarm:post:${seqNum}`;
+    if (uiState.activeTab !== 'swarm') {
+      uiState.activeTab = 'swarm';
+      uiState.unreadTabs.delete('swarm');
+    }
+    uiState.swarmLayers.add('board');
+    if (uiState.swarmMemberFilter) {
+      const targetItem = (uiState.data?.swarm?.items || []).find((i) => i.id === targetId);
+      if (targetItem && targetItem.agent !== uiState.swarmMemberFilter) {
+        uiState.swarmMemberFilter = '';
+      }
+    }
+    uiState.collapsed.delete(targetId);
+    uiState.followLatest = false;
+    renderFeed();
+
+    const card = [...$('feed').children].find((c) => c.dataset.itemCard === targetId);
+    if (!card) {
+      showToast(`未找到 Swarm 消息 #${seqNum}`);
+      return;
+    }
+    card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    card.classList.remove('flash-highlight');
+    void card.offsetWidth;
+    card.classList.add('flash-highlight');
+  }
+
   // ---------- Event Handlers ----------
+  $('stream-tabs').addEventListener('click', (e) => {
+    const btn = e.target.closest('.stream-tab');
+    if (!btn) return;
+    switchTab(btn.dataset.tab, { autoSwitched: false });
+  });
+
+  $('side-subbar').addEventListener('click', (e) => {
+    const srcBtn = e.target.closest('[data-side-source]');
+    if (srcBtn) {
+      uiState.sideSourceFilter = srcBtn.dataset.sideSource || '';
+      uiState.pendingScrollReset = true;
+      renderFeed();
+      return;
+    }
+    const layerBtn = e.target.closest('[data-side-layer]');
+    if (layerBtn) {
+      const layer = layerBtn.dataset.sideLayer;
+      if (uiState.sideLayers.has(layer)) {
+        if (uiState.sideLayers.size > 1) uiState.sideLayers.delete(layer);
+      } else {
+        uiState.sideLayers.add(layer);
+      }
+      renderFeed();
+    }
+  });
+
+  $('swarm-subbar').addEventListener('click', (e) => {
+    const memBtn = e.target.closest('[data-swarm-member]');
+    if (memBtn) {
+      const m = memBtn.dataset.swarmMember || '';
+      uiState.swarmMemberFilter = uiState.swarmMemberFilter === m ? '' : m;
+      uiState.pendingScrollReset = true;
+      renderFeed();
+      return;
+    }
+    const layerBtn = e.target.closest('[data-swarm-layer]');
+    if (layerBtn) {
+      const layer = layerBtn.dataset.swarmLayer;
+      if (uiState.swarmLayers.has(layer)) {
+        if (uiState.swarmLayers.size > 1) uiState.swarmLayers.delete(layer);
+      } else {
+        uiState.swarmLayers.add(layer);
+      }
+      renderFeed();
+    }
+  });
+
   $('feed').addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
     const action = btn.dataset.action;
-    // Cards are reused in place, so the owning step is read from the card
-    // (`data-step-card`) instead of a per-button `data-step` attribute.
-    const cardEl = btn.closest('[data-step-card]');
-    const stepIndex = Number(btn.dataset.step ?? cardEl?.dataset.stepCard);
-    if (!Number.isFinite(stepIndex)) return;
-    const step = (uiState.data?.steps || []).find((s) => s.stepIndex === stepIndex);
-    if (!step) return;
+
+    if (action === 'jump-seq') {
+      const seq = Number(btn.dataset.seq);
+      if (Number.isInteger(seq) && seq > 0) {
+        jumpToSwarmSeq(seq);
+      }
+      return;
+    }
+
+    const cardEl = btn.closest('[data-item-card]');
+    const itemId = cardEl?.dataset.itemCard;
+    if (!itemId) return;
+
+    const allItems = getRawItemsForTab(uiState.activeTab);
+    const item = allItems.find((s) => s.id === itemId);
+    if (!item) return;
 
     if (action === 'toggle-collapse') {
-      if (uiState.collapsed.has(stepIndex)) {
-        uiState.collapsed.delete(stepIndex);
+      if (uiState.collapsed.has(itemId)) {
+        uiState.collapsed.delete(itemId);
       } else {
-        uiState.collapsed.add(stepIndex);
+        uiState.collapsed.add(itemId);
       }
       renderFeed();
       return;
     }
 
     if (action === 'card-mode') {
-      uiState.perCardMode.set(stepIndex, btn.dataset.mode);
+      uiState.perCardMode.set(itemId, btn.dataset.mode);
       renderFeed();
       return;
     }
 
     if (action === 'copy') {
-      const mode = getEffectiveMode(step);
-      const text = getCopyText(step, mode);
+      const mode = getEffectiveMode(item);
+      const text = getCopyText(item, mode);
       try {
         await navigator.clipboard.writeText(text);
         showToast('已复制到剪贴板');
@@ -880,7 +1302,7 @@
           method: 'POST',
           body: JSON.stringify({
             conversationId: uiState.conversationId,
-            stepIndex,
+            itemId: item.id,
             force: true,
           }),
         });
@@ -914,16 +1336,35 @@
     }
   });
 
+  $('btn-smart-follow').addEventListener('click', async () => {
+    const next = !uiState.smartFollow;
+    uiState.smartFollow = next;
+    updateHeaderControls();
+    try {
+      await apiFetch('/api/settings', {
+        method: 'POST',
+        body: JSON.stringify({ smartFollow: next }),
+      });
+      showToast(next ? '⚡ 已开启跨通道智能跟随' : '已关闭跨通道自动切换（新动态将以红点提示）');
+    } catch {
+      // Keep local toggle state
+    }
+  });
+
   $('btn-translate-all').addEventListener('click', async () => {
     const btn = $('btn-translate-all');
     btn.disabled = true;
     try {
       await apiFetch('/api/translate', {
         method: 'POST',
-        body: JSON.stringify({ conversationId: uiState.conversationId, force: false }),
+        body: JSON.stringify({
+          conversationId: uiState.conversationId,
+          tab: uiState.activeTab,
+          force: false,
+        }),
       });
       await pollState(true);
-      showToast('全部步骤已翻译');
+      showToast('当前视图待处理条目已翻译');
     } catch (err) {
       showToast(`翻译中断: ${err.message}`);
       await pollState(true);
@@ -933,11 +1374,11 @@
   });
 
   $('btn-collapse-all').addEventListener('click', () => {
-    const steps = uiState.data?.steps || [];
+    const items = getFilteredItemsForActiveTab();
     uiState.allCollapsed = !uiState.allCollapsed;
-    uiState.collapsed.clear();
-    if (uiState.allCollapsed) {
-      for (const s of steps) uiState.collapsed.add(s.stepIndex);
+    for (const s of items) {
+      if (uiState.allCollapsed) uiState.collapsed.add(s.id);
+      else uiState.collapsed.delete(s.id);
     }
     renderFeed();
   });
@@ -960,8 +1401,6 @@
     updateJumpButton();
   });
 
-  // Coalesced to one handler per frame: it reads layout (scrollHeight), so it
-  // must not run per wheel tick, and it must never write scrollTop itself.
   $('main').addEventListener('scroll', () => {
     if (scrollState.scrollRaf) return;
     scrollState.scrollRaf = requestAnimationFrame(() => {
@@ -972,7 +1411,6 @@
       const movedUp = top < scrollState.lastTop - 2;
       scrollState.lastTop = top;
 
-      // An emptied list clamps scrollTop to 0; that is not the reader moving.
       if (!hasCards) {
         updateJumpButton();
         return;
@@ -980,14 +1418,8 @@
       scrollState.keepTop = top;
 
       if (movedUp) {
-        // Any way of moving up (wheel, scrollbar drag, keyboard) stops following.
-        // Content growth never counts — it does not change scrollTop.
         if (uiState.followLatest) setFollowLatest(false);
       } else if (!uiState.followLatest && distanceToBottom(el) <= RESUME_EPS) {
-        // Only a real bottom re-enables following, and never while a wheel
-        // gesture is still settling — otherwise a 1-notch scroll-up near the
-        // bottom instantly re-arms auto-follow and the next poll jumps to the
-        // newest translated card. Inside the window, decide once it closes.
         if (gestureActive()) scheduleResumeCheck();
         else setFollowLatest(true);
       }
@@ -995,10 +1427,6 @@
     });
   }, { passive: true });
 
-  // Any wheel tick (either direction) marks the gesture window. Nothing else in
-  // this file writes scrollTop during it, so Chromium's smooth wheel animation
-  // is never interrupted. Wheel-up additionally drops follow before the next
-  // paint, so no pending render can pull the view back.
   $('main').addEventListener('wheel', (e) => {
     scrollState.wheelAt = nowMs();
     scrollState.pendingShift = 0;
@@ -1020,7 +1448,6 @@
     touchY = y;
   }, { passive: true });
 
-  // Web font swap can change card heights after paint; re-pin if still following.
   if (document.fonts?.ready) {
     document.fonts.ready.then(() => {
       if (uiState.followLatest) requestPinToBottom();
@@ -1031,8 +1458,6 @@
     const next = e.target.value;
     if (next === uiState.searchQuery) return;
     uiState.searchQuery = next;
-    // Filtering is a deliberate context change: show the matches from the top
-    // and stop chasing the newest card (it would jump there on the next poll).
     uiState.pendingScrollReset = true;
     if (uiState.followLatest) setFollowLatest(false);
     renderFeed();
@@ -1043,7 +1468,10 @@
     uiState.etag = '';
     uiState.collapsed.clear();
     uiState.perCardMode.clear();
-    // Different transcript: a held position from the old one is meaningless.
+    uiState.unreadTabs.clear();
+    uiState.sideSourceFilter = '';
+    uiState.swarmMemberFilter = '';
+    uiState.initialStreamSnapDone = false;
     uiState.pendingScrollReset = true;
     pollState(true);
   });
@@ -1057,6 +1485,13 @@
     const s = uiState.data?.settings || {};
     $('cfg-provider').value = s.provider || 'bing';
     $('cfg-view-mode').value = s.defaultViewMode || 'translation';
+    $('cfg-smart-follow').checked = s.smartFollow !== false;
+    $('cfg-side-questions').checked = s.translateSideQuestions !== false;
+    $('cfg-ask-questions').checked = s.translateAskQuestions !== false;
+    $('cfg-subagents').checked = s.translateSubagents !== false;
+    $('cfg-swarm-board').checked = s.translateSwarmBoard !== false;
+    $('cfg-swarm-workers').checked = s.translateSwarmWorkers !== false;
+    $('cfg-swarm-overview').checked = s.translateSwarmOverview !== false;
     $('cfg-skip-zh').checked = s.skipChinese !== false;
     $('cfg-inline-hook').checked = s.inlineHook !== false;
     $('cfg-base-url').value = s.openai?.baseUrl || 'https://api.deepseek.com/v1';
@@ -1100,6 +1535,13 @@
     return {
       provider: $('cfg-provider').value,
       defaultViewMode: $('cfg-view-mode').value,
+      smartFollow: $('cfg-smart-follow').checked,
+      translateSideQuestions: $('cfg-side-questions').checked,
+      translateAskQuestions: $('cfg-ask-questions').checked,
+      translateSubagents: $('cfg-subagents').checked,
+      translateSwarmBoard: $('cfg-swarm-board').checked,
+      translateSwarmWorkers: $('cfg-swarm-workers').checked,
+      translateSwarmOverview: $('cfg-swarm-overview').checked,
       skipChinese: $('cfg-skip-zh').checked,
       inlineHook: $('cfg-inline-hook').checked,
       openai: {
@@ -1147,6 +1589,7 @@
         body: JSON.stringify(payload),
       });
       uiState.globalMode = res.settings.defaultViewMode;
+      uiState.smartFollow = res.settings.smartFollow !== false;
       uiState.perCardMode.clear();
       closeSettings();
       await pollState(true);
@@ -1156,7 +1599,7 @@
     }
   });
 
-  // Start initial sync.
+  // ---------- Bootstrap ----------
   refreshConversations();
   pollState(true);
   setInterval(refreshConversations, 8000);

@@ -1,12 +1,12 @@
 {
   "name": "think-translate",
   "displayName": "思考翻译 (Think Translate)",
-  "version": "1.0.0",
-  "description": "Replicates DeepSeek Harness thinking translation: translates agent reasoning steps into Simplified Chinese in a live side pane with Original/Bilingual/Translation toggle, caching, and one-click retry.",
+  "version": "1.1.0",
+  "description": "Replicates DeepSeek Harness thinking translation & auto-translates sidebar streams: main reasoning steps, Side Questions (/btw), ask_question cards, Subagents, and Swarm multi-agent board/overview/worker thoughts into Simplified Chinese with Smart Auto-Follow and Original/Bilingual/Translation toggles.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "打开思考过程翻译面板",
+    "打开思考与侧边栏多智能体翻译面板",
     "查看当前思考翻译插件状态与引擎配置",
-    "用 /think-translate 打开右侧实时中文思考对照窗"
+    "用 /think-translate 打开右侧实时中文思考与 Swarm 翻译对照窗"
   ]
 }

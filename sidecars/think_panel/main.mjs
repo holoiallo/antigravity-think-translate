@@ -2,8 +2,10 @@
  * Think Translate sidecar server.
  *
  * Serves the Auxiliary Pane Web UI and exposes JSON routes to read the active
- * conversation's thinking steps, manage translation cache/settings, and run
- * translations using Bing / Google / OpenAI-compatible providers.
+ * conversation's 3 translation streams (Main Thinking, Side Questions / Subagents /
+ * ask_question cards, and Swarm Multi-Agent Board / Overview / Worker Thinking),
+ * manage translation cache/settings, and run translations using Bing / Google /
+ * OpenAI-compatible providers.
  */
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -14,7 +16,7 @@ import {
   findAppDataDirs,
   ID_RE,
   listRecentConversations,
-  readConversationThinking,
+  readConversationStreams,
   resolveSidecarDataDir,
 } from './transcript.mjs';
 import { ThinkingTranslator } from './translator.mjs';
@@ -30,8 +32,7 @@ console.log(`[think_panel] dataDir: ${dataDir}`);
 const app = new SidecarApp();
 
 // The pane runs inside an embedded webview that happily keeps a cached
-// app.js / styles.css across reloads. A stale bundle means a shipped UI fix
-// never reaches the user, so every static asset is served non-cacheable.
+// app.js / styles.css across reloads. Every static asset is served non-cacheable.
 const NO_STORE_HEADERS = {
   'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
   Pragma: 'no-cache',
@@ -57,53 +58,97 @@ app.page('/', serveText('index.html', 'text/html; charset=utf-8'));
 app.api('/styles.css', serveText('styles.css', 'text/css; charset=utf-8'), 'GET');
 app.api('/app.js', serveText('app.js', 'application/javascript; charset=utf-8'), 'GET');
 
-function buildStatePayload(conversationId) {
+function enrichItem(item) {
+  const tr = translator.getStepTranslationState(item);
+  return {
+    ...item,
+    ...tr,
+  };
+}
+
+function buildAutoTranslateQueue(streams, activeTab = 'main') {
+  const mainRecent = streams.mainSteps.slice(-12);
+  const sideRecent = streams.sideItems.slice(-16);
+  const swarmRecent = streams.swarm.items.slice(-20);
+
+  // Note: scheduleAutoTranslate reverses the array it receives, so items at the
+  // END of the returned array are translated FIRST.
+  if (activeTab === 'swarm') {
+    return [...mainRecent, ...sideRecent, ...swarmRecent];
+  }
+  if (activeTab === 'side') {
+    return [...mainRecent, ...swarmRecent, ...sideRecent];
+  }
+  return [...swarmRecent, ...sideRecent, ...mainRecent];
+}
+
+function buildStatePayload(conversationId, activeTab = 'main') {
   const settings = translator.getPublicSettings();
   const resolvedConv = conversationId || app.config.conversationId || '';
   if (!resolvedConv || !ID_RE.test(resolvedConv)) {
     return {
       conversationId: resolvedConv || null,
+      rootConvId: null,
+      rootTitle: '',
+      focusedChild: null,
       exists: false,
       steps: [],
+      mainSteps: [],
+      sideItems: [],
+      sideSources: [],
+      swarm: { exists: false, title: '', members: [], channels: [], items: [] },
+      streamMeta: {
+        main: { count: 0, latestTs: 0, headKey: '' },
+        side: { count: 0, latestTs: 0, headKey: '' },
+        swarm: { count: 0, latestTs: 0, headKey: '' },
+      },
       settings,
       etag: `none|${JSON.stringify(settings)}`,
     };
   }
 
-  const { exists, sig, steps } = readConversationThinking(appDataDirs, resolvedConv);
-  if (exists && steps.length > 0) {
-    translator.scheduleAutoTranslate(steps);
+  const streams = readConversationStreams(appDataDirs, resolvedConv, settings);
+  if (streams.exists) {
+    const queue = buildAutoTranslateQueue(streams, activeTab);
+    if (queue.length > 0) {
+      translator.scheduleAutoTranslate(queue);
+    }
   }
 
-  const enrichedSteps = steps.map((step) => {
-    const tr = translator.getStepTranslationState(step);
-    return {
-      stepIndex: step.stepIndex,
-      createdAt: step.createdAt,
-      status: step.status,
-      thinking: step.thinking,
-      thoughtHash: step.thoughtHash,
-      toolNames: step.toolNames,
-      hasReply: step.hasReply,
-      outputTokens: step.outputTokens,
-      charCount: step.charCount,
-      ...tr,
-    };
-  });
+  const enrichedMain = streams.mainSteps.map(enrichItem);
+  const enrichedSide = streams.sideItems.map(enrichItem);
+  const enrichedSwarmItems = streams.swarm.items.map(enrichItem);
+
+  const statusSig = (list) =>
+    list.map((s) => `${s.id}:${s.thoughtHash}:${s.translationStatus}:${s.error || ''}`).join(',');
 
   const digestSource = JSON.stringify({
     resolvedConv,
-    exists,
-    sig,
+    rootConvId: streams.rootConvId,
+    exists: streams.exists,
+    sig: streams.sig,
     settings,
-    statuses: enrichedSteps.map((s) => `${s.stepIndex}:${s.thoughtHash}:${s.translationStatus}:${s.error || ''}`),
+    mainSt: statusSig(enrichedMain),
+    sideSt: statusSig(enrichedSide),
+    swarmSt: statusSig(enrichedSwarmItems),
   });
   const etag = createHash('sha1').update(digestSource).digest('hex');
 
   return {
     conversationId: resolvedConv,
-    exists,
-    steps: enrichedSteps,
+    rootConvId: streams.rootConvId,
+    rootTitle: streams.rootTitle,
+    focusedChild: streams.focusedChild,
+    exists: streams.exists,
+    steps: enrichedMain,
+    mainSteps: enrichedMain,
+    sideItems: enrichedSide,
+    sideSources: streams.sideSources,
+    swarm: {
+      ...streams.swarm,
+      items: enrichedSwarmItems,
+    },
+    streamMeta: streams.streamMeta,
     settings,
     etag,
   };
@@ -111,9 +156,15 @@ function buildStatePayload(conversationId) {
 
 app.api('/api/state', (data) => {
   const convId = typeof data.conversationId === 'string' ? data.conversationId.trim() : '';
-  const payload = buildStatePayload(convId);
+  const activeTab = typeof data.activeTab === 'string' ? data.activeTab.trim() : 'main';
+  const payload = buildStatePayload(convId, activeTab);
   if (data.etag && data.etag === payload.etag) {
-    return jsonNoStore({ unchanged: true, etag: payload.etag, conversationId: payload.conversationId });
+    return jsonNoStore({
+      unchanged: true,
+      etag: payload.etag,
+      conversationId: payload.conversationId,
+      rootConvId: payload.rootConvId,
+    });
   }
   return jsonNoStore(payload);
 }, 'GET');
@@ -129,19 +180,40 @@ app.api('/api/translate', async (data) => {
   const convId = typeof data.conversationId === 'string' && data.conversationId.trim()
     ? data.conversationId.trim()
     : (app.config.conversationId || '');
-  const stepIndex = Number(data.stepIndex);
+  const itemId = typeof data.itemId === 'string' ? data.itemId.trim() : '';
+  const stepIndex = data.stepIndex !== undefined && data.stepIndex !== null ? Number(data.stepIndex) : NaN;
+  const tab = typeof data.tab === 'string' ? data.tab.trim() : '';
   const force = Boolean(data.force);
 
-  const { exists, steps } = readConversationThinking(appDataDirs, convId);
-  if (!exists) {
+  const settings = translator.getPublicSettings();
+  const streams = readConversationStreams(appDataDirs, convId, settings);
+  if (!streams.exists) {
     return new Response(JSON.stringify({ error: '未找到会话日志' }), {
       status: 404,
       contentType: 'application/json',
     });
   }
 
+  const allItems = [
+    ...streams.mainSteps,
+    ...streams.sideItems,
+    ...streams.swarm.items,
+  ];
+
+  if (itemId) {
+    const target = allItems.find((s) => s.id === itemId);
+    if (!target) {
+      return new Response(JSON.stringify({ error: `未找到条目 ${itemId}` }), {
+        status: 404,
+        contentType: 'application/json',
+      });
+    }
+    const result = await translator.translateStep(target, { force });
+    return { ok: true, itemId: target.id, stepIndex: target.stepIndex, result };
+  }
+
   if (Number.isInteger(stepIndex)) {
-    const target = steps.find((s) => s.stepIndex === stepIndex);
+    const target = streams.mainSteps.find((s) => s.stepIndex === stepIndex);
     if (!target) {
       return new Response(JSON.stringify({ error: `未找到 Step #${stepIndex}` }), {
         status: 404,
@@ -149,19 +221,25 @@ app.api('/api/translate', async (data) => {
       });
     }
     const result = await translator.translateStep(target, { force });
-    return { ok: true, stepIndex, result };
+    return { ok: true, itemId: target.id, stepIndex, result };
   }
 
-  // Translate all pending/selected steps when no specific stepIndex is given.
-  const results = [];
-  for (const step of [...steps].reverse()) {
-    const state = translator.getStepTranslationState(step);
+  // Bulk translate pending/error items in the target tab (or all tabs)
+  let pool = allItems;
+  if (tab === 'main') pool = streams.mainSteps;
+  else if (tab === 'side') pool = streams.sideItems;
+  else if (tab === 'swarm') pool = streams.swarm.items;
+
+  const translatedIds = [];
+  for (const item of [...pool].reverse()) {
+    const state = translator.getStepTranslationState(item);
     if (force || state.translationStatus === 'pending' || state.translationStatus === 'error') {
-      await translator.translateStep(step, { force });
-      results.push(step.stepIndex);
+      await translator.translateStep(item, { force });
+      translatedIds.push(item.id);
+      if (translatedIds.length >= 30) break;
     }
   }
-  return { ok: true, translatedSteps: results };
+  return { ok: true, translatedIds };
 }, 'POST');
 
 app.api('/api/settings', (data) => {
